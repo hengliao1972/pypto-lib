@@ -115,7 +115,150 @@ So the library and IR should be designed to **ease cross-composite loop fusion**
 
 ---
 
-## 4. Primitive Set: ATen-Like Scope (Tensor-Level)
+## 4. Incore Scope
+
+The **incore scope** is a way for the user to specify **where the boundary between orchestration (e.g. host/AICPU) and incore compute (e.g. AICore)** lies, without changing the logical algorithm. By inserting an **incore scope directive** into the source code of a Python program, the user can define the boundaries of incore scopes and **adjust them with ease** (e.g. move a few lines in or out of the scope) to tune placement and data movement.
+
+### 4.1 What an Incore Scope Is
+
+- An incore scope defines an **anonymous incore function**: a region of code that will be compiled as a separate **incore** kernel (e.g. running on AICore), **without the user explicitly specifying the function's arguments**. The compiler derives the arguments from how variables are used across the scope boundary (see below).
+
+- **Definition and call in one place**: The incore scope does **not** only define the function. It also defines a **reference (call)** to this function from the **parent function** at the **exact location** where the scope appears. So the parent (orchestration) code runs until it hits the scope, then **calls** the generated incore function (with the derived arguments), then continues. No separate "define elsewhere, call here" is required; the scope is both the definition and the call site.
+
+- **Naming**: The compiler automatically generates a **distinctive name** for the anonymous incore function, using the **parent function's name as a prefix** to keep names human-readable and debuggable (e.g. `my_kernel_incore_0`, `my_kernel_incore_1` if there are multiple scopes in `my_kernel`).
+
+### 4.2 Compiler-Derived Arguments
+
+The compiler **automatically derives** the arguments of the anonymous incore function using the following criteria:
+
+| Role | Rule | Meaning |
+|------|------|--------|
+| **Input** | Defined **outside** the scope, **referenced inside** the scope **without modification** (read-only) | Passed as an **input** argument to the incore function. Data is read by incore; no obligation to write back. |
+| **Inout** | Defined **outside** the scope, **modified inside** the scope | Passed as an **inout** argument (e.g. by reference). The incore function may read and write; changes are visible to the parent after the call. |
+| **Output** | Defined **outside** the scope; **unassigned** by the parent; **assigned (written)** by the incore scope; **read** by the parent after the scope | Treated as an **output** argument. It is passed into the incore function **by reference**. The **memory space** for this symbol is **allocated by the runtime when the incore function is called (submitted)**. The incore function writes into that buffer; after the call, the parent reads the symbol. |
+
+**Output in more detail:** A symbol that is defined outside the incore scope, left **unassigned** by the parent, **written** inside the incore scope, and **read** by the parent after the scope is classified as **output**. The compiler passes it as an output argument by reference. The **runtime allocates** its memory when the incore function is **called (submitted)**; the incore function receives the reference and writes into that buffer, and the parent then uses the same symbol (backed by that buffer) after the call.
+
+### 4.3 Example: Defining an Incore Scope and Equivalent After Analysis
+
+**User source (Python with incore scope directive):**
+
+Assume a directive such as `with incore_scope():` (or `@incore` on a block, or a comment/directive the compiler recognizes). The following is conceptual.
+
+```python
+def my_kernel(x: Tensor, y: Tensor) -> Tensor:
+    # x, y are inputs from parent/caller
+    n, c = x.shape[0], x.shape[1]
+    tmp: Tensor   # defined outside, unassigned by parent; written inside incore_scope; read after
+    with incore_scope():
+        # Inside: read x, y (read-only); write tmp (output).
+        for i in range(n):
+            for j in range(c):
+                tmp[i, j] = x[i, j] + y[i, j]   # tmp is written inside; x, y only read
+    # After scope: read tmp
+    result = reduce_sum(tmp, axis=1)
+    return result
+```
+
+**Equivalent after compiler argument analysis:**
+
+The compiler (1) generates a named incore function with **explicit** arguments derived from the rules above, and (2) inserts a **call** at the scope location in the parent, passing those arguments.
+
+**Generated anonymous incore function (conceptual):**
+
+```python
+# Compiler-generated name: my_kernel_incore_0
+def my_kernel_incore_0(
+    x: Tensor,      # input: defined outside, read-only inside
+    y: Tensor,      # input: defined outside, read-only inside
+    tmp: Tensor,    # output: defined outside, unassigned by parent, written inside, read after; passed by reference
+) -> None:
+    n, c = x.shape[0], x.shape[1]
+    for i in range(n):
+        for j in range(c):
+            tmp[i, j] = x[i, j] + y[i, j]
+```
+
+**Parent function with explicit call (conceptual):**
+
+```python
+def my_kernel(x: Tensor, y: Tensor) -> Tensor:
+    n, c = x.shape[0], x.shape[1]
+    tmp: Tensor   # output: unassigned by parent; runtime allocates when incore is called
+    my_kernel_incore_0(x, y, tmp)       # call at scope location: x, y inputs; tmp output by reference
+    result = reduce_sum(tmp, axis=1)
+    return result
+```
+
+So: **Inputs** `x` and `y` (defined outside, only read inside) become **input** parameters of `my_kernel_incore_0`. **Output** `tmp` (defined outside, unassigned by parent, written inside the scope, read after) becomes an **output** argument passed by reference; the **runtime allocates** its memory when the incore function is **called (submitted)**. If `tmp` were read and then written inside the scope, the compiler would classify it as **inout**.
+
+---
+
+**More complicated example: multiple inputs, inout, and output**
+
+User source: one incore scope with two inputs, one **inout** buffer (read and updated inside the scope), and one output. The parent initializes the inout buffer before the scope and reads it after.
+
+```python
+def fused_update(x: Tensor, y: Tensor, scale: float) -> Tensor:
+    n, c = x.shape[0], x.shape[1]
+    acc: Tensor = zeros((n, c), dtype=float32)   # parent assigns: acc is inout, not output
+    out: Tensor      # defined outside, unassigned by parent; output
+    with incore_scope():
+        # Inputs: x, y, scale (read-only).
+        # Inout: acc (read and written: acc[i,j] += x[i,j] * scale).
+        # Output: out (written here, read by parent after).
+        for i in range(n):
+            for j in range(c):
+                acc[i, j] += x[i, j] * scale    # inout: read then write
+                out[i, j] = y[i, j] + acc[i, j] # output: write; uses updated acc
+    # After scope: read acc and out
+    result = reduce_sum(out, axis=1) + reduce_sum(acc, axis=1)
+    return result
+```
+
+**Equivalent after compiler argument analysis:**
+
+Generated incore function (multiple inputs, one inout, one output):
+
+```python
+# Compiler-generated name: fused_update_incore_0
+def fused_update_incore_0(
+    x: Tensor,       # input: read-only inside
+    y: Tensor,       # input: read-only inside
+    scale: float,    # input: read-only inside
+    acc: Tensor,     # inout: read and written inside; parent assigned before, reads after
+    out: Tensor,     # output: unassigned by parent, written inside, read after; runtime allocates
+) -> None:
+    n, c = x.shape[0], x.shape[1]
+    for i in range(n):
+        for j in range(c):
+            acc[i, j] += x[i, j] * scale
+            out[i, j] = y[i, j] + acc[i, j]
+```
+
+Parent with explicit call:
+
+```python
+def fused_update(x: Tensor, y: Tensor, scale: float) -> Tensor:
+    n, c = x.shape[0], x.shape[1]
+    acc = zeros((n, c), dtype=float32)   # inout: parent creates and initializes
+    out: Tensor      # output: runtime allocates when incore is called
+    fused_update_incore_0(x, y, scale, acc, out)
+    result = reduce_sum(out, axis=1) + reduce_sum(acc, axis=1)
+    return result
+```
+
+So: **Inputs** `x`, `y`, `scale` (read-only inside) → input args. **Inout** `acc` (assigned by parent before scope, read and written inside, read after) → inout arg passed by reference; parent creates and initializes it. **Output** `out` (unassigned by parent, written inside, read after) → output arg by reference; **runtime allocates** when the incore is called.
+
+### 4.4 Summary
+
+- **Incore scope directive** in the source marks a region that becomes an **anonymous incore function** plus a **call** at that point in the parent.
+- **Arguments are derived**: **input** (outside, read-only inside), **inout** (outside, modified inside), **output** (defined outside, unassigned by parent, written inside scope, read by parent after; passed by reference; memory allocated by runtime when incore is called/submitted).
+- The compiler generates a **readable name** (parent name as prefix) and **explicit** function parameters and call site so that the runtime can allocate and pass buffers and the incore boundary is clear and easy to adjust.
+
+---
+
+## 5. Primitive Set: ATen-Like Scope (Tensor-Level)
 
 The set of primitive functions in PyPTO-Lib is **tensor-level**, similar in scope to **PyTorch ATen**: the API operates on tensors (shapes, axes, dtypes). The compiler then tiles these and lowers to PTO-ISA; there is no separate “tile-level primitive set” on top of PTO-ISA. The roster includes:
 
@@ -131,9 +274,9 @@ The **exact roster** can be expanded or trimmed to match ATen’s usage and the 
 
 ---
 
-## 5. Example: Softmax from Tensor-Level Primitives
+## 6. Example: Softmax from Tensor-Level Primitives
 
-### 5.1 Tensor-Level Primitives Used
+### 6.1 Tensor-Level Primitives Used
 
 Softmax is expressed at the **tensor level** using these primitives:
 
@@ -145,7 +288,7 @@ Softmax is expressed at the **tensor level** using these primitives:
 
 Formula (over last axis): **softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))**.
 
-### 5.2 Softmax as One Composite (One Loop = Manual Fusion)
+### 6.2 Softmax as One Composite (One Loop = Manual Fusion)
 
 At the **tensor level**, softmax is a single composite that **calls** these primitives in sequence. The **compiler** lowers this to **one** tile loop whose body is the lowered sequence (max → sub → exp → sum → div) for each tile. So “multiple tile ops in one loop” is **by construction**: the composite is defined as one logical function, and the lowering produces one loop. That is effectively **manual fusion** of the tile sequence into one loop—no cross-composite fusion is involved.
 
@@ -158,7 +301,7 @@ softmax(x) = div(exp(sub(x, max(x, axis=-1, keepdim=True))),
 
 The compiler tiles this, introduces cast_tensor_to_tile / cast_tile_to_tensor as needed, and emits one loop over tiles with that body. Tail handling is part of the lowering.
 
-### 5.3 The Real Challenge: Fusing Loops Across Multiple Composite Functions
+### 6.3 The Real Challenge: Fusing Loops Across Multiple Composite Functions
 
 The **hard** problem is when the user writes **two (or more) composite functions** in sequence, e.g.:
 
@@ -182,7 +325,7 @@ Without fusion, code is: **loop_softmax** (over all tiles); then **loop_relu** (
 
 **What makes this difficult:** The representation must expose **per-composite** loop structure and **data flow between composites** so the compiler can match loops, check alignment, and merge. Different tiling or shapes between the two composites can make fusion illegal or require more complex transformations. So the library and IR design should aim to **ease this cross-composite fusion analysis**, rather than adding another layer of tile-level “primitives” on top of PTO-ISA.
 
-### 5.4 Strategies to Ease Cross-Composite Fusion
+### 6.4 Strategies to Ease Cross-Composite Fusion
 
 Two complementary strategies can reduce the difficulty of establishing producer/consumer relationships and avoiding unnecessary main-memory traffic:
 
@@ -240,7 +383,7 @@ Two complementary strategies can reduce the difficulty of establishing producer/
 
 Together, full unroll is a simple option for small tile counts where constant propagation and per-index fusion suffice; power-of-2 predicated expansion keeps the structure regular and scalable while still giving the compiler equal-shape chunks so it can fuse **across** composites without full expansion.
 
-### 5.5 Further analysis: power-of-2 predicated expansion
+### 6.5 Further analysis: power-of-2 predicated expansion
 
 #### Does it support loop fusion for non-parallel for?
 
@@ -304,7 +447,7 @@ This keeps the expansion predictable and the fusion pass simple: only a small, f
 
 ---
 
-## 6. Build Method Summary
+## 7. Build Method Summary
 
 1. **Define primitives in pypto IR**  
    Implement each primitive as one or more pypto IR programs using the existing op set (tensor ops, block ops, sync ops) and registration mechanism in `pypto/src/ir/op/`.
@@ -323,7 +466,7 @@ This keeps the expansion predictable and the fusion pass simple: only a small, f
 
 ---
 
-## 7. Relationship to Other Repositories
+## 8. Relationship to Other Repositories
 
 | Component   | Role relative to PyPTO-Lib |
 |------------|-----------------------------|
@@ -333,7 +476,7 @@ This keeps the expansion predictable and the fusion pass simple: only a small, f
 
 ---
 
-## 8. Summary
+## 9. Summary
 
 **PyPTO-Lib** is a **tensor-level** primitive library (not a tile-level one): defining yet another function set at the tile level would add little value over PTO-ISA. Primitives are **tensor** ops (max, exp, sum, add, div, etc.); the **compiler** tiles them and lowers to PTO-ISA.
 
@@ -343,4 +486,6 @@ This keeps the expansion predictable and the fusion pass simple: only a small, f
 2. **Tail blocks and padding**: Lowering handles non-divisible dimensions and padding for correct behavior.
 3. **Cross-composite loop fusion**: Putting many tile ops in **one** composite (e.g. softmax) is **manual fusion**—one loop by design. The **remaining challenge** is **fusing loops across multiple composite functions** (e.g. `relu(softmax(x))` → one loop that does softmax then relu per tile). The representation and compiler must support **cross-composite** fusion: same iteration space, producer–consumer data flow, and loop merging.
 
-This document describes the **method** of building that library; concrete primitive lists, build scripts, and fusion-pass design can be added in the same folder as the library is implemented.
+**Incore scope** (Section 4): The user inserts an **incore scope directive** in Python source to mark the boundary between orchestration and incore compute. The scope defines an **anonymous incore function** (no explicit args) and a **call** at that location. The compiler derives **input** (outside, read-only inside), **inout** (outside, modified inside), and **output** (defined outside, unassigned by parent, written inside scope, read by parent after; passed by reference; memory allocated by runtime when incore is called/submitted), and generates a readable name (parent name as prefix) and explicit parameters/call site.
+
+This document describes the **method** of building that library; concrete primitive lists, build scripts, fusion-pass design, and incore-scope implementation can be added in the same folder as the library is implemented.
