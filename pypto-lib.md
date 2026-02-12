@@ -139,7 +139,20 @@ The compiler **automatically derives** the arguments of the anonymous incore fun
 
 **Output in more detail:** A symbol that is defined outside the incore scope, left **unassigned** by the parent, **written** inside the incore scope, and **read** by the parent after the scope is classified as **output**. The compiler passes it as an output argument by reference. The **runtime allocates** its memory when the incore function is **called (submitted)**; the incore function receives the reference and writes into that buffer, and the parent then uses the same symbol (backed by that buffer) after the call.
 
-### 4.3 Example: Defining an Incore Scope and Equivalent After Analysis
+### 4.3 How to choose incore_scope
+
+There is an essential **rule of thumb**: the **intermediate data usage within the incore scope must not exceed the size of the SRAM buffer inside the processor core**. The working space of the incore function (inputs, outputs, and any temporaries used inside the scope) needs to **fit into that on-core SRAM**. If it does not, data will **spill to global memory**, which leads to a **severe performance penalty** because of memory bandwidth limits and the latency of global memory access—the **memory wall**. Therefore, placing the incore scope boundary so that all live data inside the scope fits in core SRAM is the primary constraint for both correctness of placement and performance.
+
+To support this:
+
+- **Compiler**: The compiler can provide a **tool to estimate the memory usage within a given scope** (e.g. by summing the sizes of all live tensors/tiles and temporaries at each point in the scope, possibly with a simple allocation model). That estimate can be compared against the target core’s SRAM size to guide or validate scope boundaries.
+- **Programmer**: The programmer can **estimate memory usage manually** (e.g. from tensor/tile shapes and known temporary buffers) and use that estimate as the **most important guideline** when choosing where to start and end incore scopes. If the estimated working set exceeds SRAM, the scope should be narrowed (e.g. move some computation or loops outside the scope, or tile so that each incore invocation uses less data).
+
+In short: **keep the incore scope’s working set within core SRAM**; use compiler-based or manual memory estimates as the main guide for setting scope boundaries.
+
+**Runtime and IDE integration.** The runtime **pto-rt2** (simpler) already provides **scope_begin()**, **scope_end()**, and **ring-heap–based memory allocation**, so it can perform **accurate accounting of memory workspace usage per scope**. The runtime can **collect statistics** on memory usage size for each scope (or each scope/level). This information should be **incorporated into the IDE** so that programmers can **inspect it easily** (e.g. per-scope or per-level usage, peak usage, or comparison with SRAM capacity). The same statistics can be used for **manual tuning** of incore scope boundaries and for **automatic adjustment** of frontend incore scope boundaries (e.g. a tool that suggests moving scope boundaries inward or outward based on measured usage versus SRAM size).
+
+### 4.4 Example: Defining an Incore Scope and Equivalent After Analysis
 
 **User source (Python with incore scope directive):**
 
@@ -250,7 +263,7 @@ def fused_update(x: Tensor, y: Tensor, scale: float) -> Tensor:
 
 So: **Inputs** `x`, `y`, `scale` (read-only inside) → input args. **Inout** `acc` (assigned by parent before scope, read and written inside, read after) → inout arg passed by reference; parent creates and initializes it. **Output** `out` (unassigned by parent, written inside, read after) → output arg by reference; **runtime allocates** when the incore is called.
 
-### 4.4 Summary
+### 4.5 Summary
 
 - **Incore scope directive** in the source marks a region that becomes an **anonymous incore function** plus a **call** at that point in the parent.
 - **Arguments are derived**: **input** (outside, read-only inside), **inout** (outside, modified inside), **output** (defined outside, unassigned by parent, written inside scope, read by parent after; passed by reference; memory allocated by runtime when incore is called/submitted).
